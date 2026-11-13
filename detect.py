@@ -23,6 +23,7 @@ import argparse
 import json
 import shutil
 import subprocess
+import threading
 import time
 from datetime import datetime
 from collections import deque
@@ -73,6 +74,7 @@ class Track:
     face_score: float = 0.0
     face_img: np.ndarray | None = None
     body_img: np.ndarray | None = None
+    faces: list = field(default_factory=list)   # best few faces: (score, time, image)
 
     @property
     def last(self) -> Sample:
@@ -119,13 +121,15 @@ def clip01(x: float) -> float:
 
 class TheftDetector:
     def __init__(self, cfg: Config, out_dir: Path, pose_weights: str, det_weights: str,
-                 imgsz: int, device: str | None):
+                 imgsz: int, device: str | None, phone_imgsz: int = 1280):
         self.cfg = cfg
         self.out = out_dir
         (out_dir / "events").mkdir(parents=True, exist_ok=True)
         self.pose = YOLO(pose_weights)
         self.det = YOLO(det_weights)
         self.imgsz = imgsz
+        self.phone_imgsz = phone_imgsz
+        self.source_name = ""
         self.device = device
         self.tracks: dict[int, Track] = {}
         self.events: dict[tuple[int, int], Event] = {}
@@ -145,7 +149,9 @@ class TheftDetector:
                 self._update_track(tid, t, box, k, frame)
                 ids.append(tid)
 
-        d = self.det.predict(frame, classes=[PHONE_CLASS], conf=0.12, imgsz=self.imgsz,
+        # phones are only 10-20 px in a station camera, so the phone model runs at a higher
+        # resolution than the pose model (measured: far more phones found at 1280 than 960)
+        d = self.det.predict(frame, classes=[PHONE_CLASS], conf=0.12, imgsz=self.phone_imgsz,
                              device=self.device, verbose=False)[0]
         self.phones = list(d.boxes.xyxy.cpu().numpy())
         self._assign_phones(ids)
@@ -211,9 +217,26 @@ class TheftDetector:
         crop = self._crop(frame, box, 0.0)
         if crop is None or min(crop.shape[:2]) < 12:
             return
-        sharp = cv2.Laplacian(cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY), cv2.CV_64F).var()
-        score = side * conf * (1.0 + min(sharp, 400.0) / 400.0)
-        if score > tr.face_score:
+        # Quality = size x frontal x sharp x keypoint confidence.
+        #   size:    distance between the eyes in pixels (also shrinks when the head turns)
+        #   frontal: nose sits midway between the eyes; 1.0 = facing the camera, ~0 = profile
+        #   sharp:   measured on a fixed 64x64 copy so big and small faces are comparable
+        dl = abs(float(k[NOSE, 0] - k[LEYE, 0]))
+        dr = abs(float(k[NOSE, 0] - k[REYE, 0]))
+        frontal = min(dl, dr) / max(dl, dr, 1e-6)
+        gray = cv2.cvtColor(cv2.resize(crop, (64, 64), interpolation=cv2.INTER_AREA), cv2.COLOR_BGR2GRAY)
+        sharp = min(cv2.Laplacian(gray, cv2.CV_64F).var(), 600.0) / 600.0
+        score = eye * (0.3 + 0.7 * frontal) * (0.15 + 0.85 * sharp) * conf
+        # keep the few best faces, taken at different moments (not 4 copies of one frame)
+        near = [c for c in tr.faces if abs(c[1] - s.t) < 0.5]
+        if near:
+            if score <= max(c[0] for c in near):
+                return
+            tr.faces = [c for c in tr.faces if abs(c[1] - s.t) >= 0.5]
+        tr.faces.append((score, s.t, crop))
+        tr.faces.sort(key=lambda c: -c[0])
+        del tr.faces[4:]
+        if tr.faces[0][1] == s.t:
             tr.face_score = score
             tr.face_img = crop
             tr.body_img = self._crop(frame, s.box, 0.05)
@@ -361,7 +384,7 @@ class TheftDetector:
         # time in the name, so earlier runs stay on the dashboard instead of being overwritten
         ev.folder = self.out / "events" / f"event_{datetime.now():%Y%m%d_%H%M%S}_{len(self.alerts):03d}"
         ev.folder.mkdir(parents=True, exist_ok=True)
-        ev.clip = [j for (ft, j) in self.buffer if ft >= ev.t0 - self.cfg.clip_before]
+        ev.clip = [(ft, j) for (ft, j) in self.buffer if ft >= ev.t0 - self.cfg.clip_before]
         print(f"[ALERT] t={t:.2f}s  suspect=#{ev.suspect}  victim=#{ev.victim}  "
               f"score={ev.score:.2f}  {ev.parts}")
         self._save_event(ev, frame)
@@ -369,11 +392,14 @@ class TheftDetector:
     def _save_event(self, ev: Event, frame: np.ndarray | None = None):
         S = self.tracks.get(ev.suspect)
         if S is not None:
-            if S.face_img is not None:
-                f = S.face_img
-                k = max(1.0, 256.0 / max(f.shape[:2]))
-                cv2.imwrite(str(ev.folder / "suspect_face.jpg"),
-                            cv2.resize(f, None, fx=k, fy=k, interpolation=cv2.INTER_CUBIC))
+            # suspect_face.jpg is the best one, suspect_face_2..4.jpg are the runners-up
+            for i, (_, _, f) in enumerate(S.faces):
+                k = max(1.0, 320.0 / max(f.shape[:2]))
+                big = cv2.resize(f, None, fx=k, fy=k, interpolation=cv2.INTER_LANCZOS4)
+                soft = cv2.GaussianBlur(big, (0, 0), 2.0)
+                big = cv2.addWeighted(big, 1.5, soft, -0.5, 0)   # mild unsharp mask
+                name = "suspect_face.jpg" if i == 0 else f"suspect_face_{i + 1}.jpg"
+                cv2.imwrite(str(ev.folder / name), big)
             if S.body_img is not None:
                 cv2.imwrite(str(ev.folder / "suspect_body.jpg"), S.body_img)
         V = self.tracks.get(ev.victim)
@@ -381,22 +407,26 @@ class TheftDetector:
             cv2.imwrite(str(ev.folder / "victim.jpg"), V.body_img)
         if frame is not None:
             cv2.imwrite(str(ev.folder / "alert_frame.jpg"), frame)
-        info = dict(captured_at=ev.captured_at, video_time=round(ev.t_alert, 2), suspect_id=ev.suspect, victim_id=ev.victim, contact_time=round(ev.t0, 2),
+        info = dict(captured_at=ev.captured_at, source=self.source_name, video_time=round(ev.t_alert, 2),
+                    suspect_id=ev.suspect, victim_id=ev.victim, contact_time=round(ev.t0, 2),
                     alert_time=round(ev.t_alert, 2), score=round(ev.score, 2), evidence=ev.parts,
                     face_captured=bool(S is not None and S.face_img is not None))
         (ev.folder / "event.json").write_text(json.dumps(info, indent=2))
 
-    def _finish_events(self, t: float, fps: float, force: bool = False):
+    def _finish_events(self, t: float, force: bool = False):
         for ev in self.alerts:
             if ev.done or not (force or t - ev.t_alert >= self.cfg.clip_after):
                 continue
             ev.done = True
             self._save_event(ev)  # face may have improved since the alert
-            if ev.clip:
-                first = cv2.imdecode(ev.clip[0], cv2.IMREAD_COLOR)
+            if len(ev.clip) >= 2:
+                # real frame rate of what was processed (a live camera on a slow PC drops frames)
+                span = ev.clip[-1][0] - ev.clip[0][0]
+                fps = min(60.0, max(1.0, (len(ev.clip) - 1) / max(span, 1e-3)))
+                first = cv2.imdecode(ev.clip[0][1], cv2.IMREAD_COLOR)
                 vw = cv2.VideoWriter(str(ev.folder / "clip.mp4"), cv2.VideoWriter_fourcc(*"mp4v"),
                                      fps, (first.shape[1], first.shape[0]))
-                for j in ev.clip:
+                for _, j in ev.clip:
                     vw.write(cv2.imdecode(j, cv2.IMREAD_COLOR))
                 vw.release()
                 ev.clip = []
@@ -433,7 +463,7 @@ class TheftDetector:
         return img
 
     # -------------------------------------------------------------------- loop
-    def step(self, frame: np.ndarray, t: float, fps: float) -> np.ndarray:
+    def step(self, frame: np.ndarray, t: float) -> np.ndarray:
         ids = self._infer(frame, t)
         self._find_contacts(ids, t)
         self._evaluate(t, frame)
@@ -444,10 +474,10 @@ class TheftDetector:
             self.buffer.append((t, jpg))
             for ev in self.alerts:
                 if not ev.done:
-                    ev.clip.append(jpg)
+                    ev.clip.append((t, jpg))
         while self.buffer and t - self.buffer[0][0] > self.cfg.clip_before + self.cfg.watch_seconds + 1:
             self.buffer.popleft()
-        self._finish_events(t, fps)
+        self._finish_events(t)
         # forget people not seen for a while (unless they are part of an alert)
         keep = {e.suspect for e in self.alerts} | {e.victim for e in self.alerts}
         for tid in [k for k, tr in self.tracks.items() if t - tr.last.t > 15 and k not in keep]:
@@ -455,55 +485,154 @@ class TheftDetector:
         return img
 
 
+class LiveReader:
+    """Reads a camera / RTSP stream in a thread and always hands out the newest frame.
+
+    Detection is slower than the camera on most PCs. Reading frame by frame would fall further
+    and further behind real time, so old frames are dropped instead. Reconnects if the stream dies.
+    """
+
+    def __init__(self, source: str):
+        self.source = int(source) if source.isdigit() else source
+        self.cap = cv2.VideoCapture(self.source)
+        self.frame, self.count, self.alive = None, 0, True
+        self.lock = threading.Lock()
+        threading.Thread(target=self._run, daemon=True).start()
+
+    def _run(self):
+        fails = 0
+        while self.alive:
+            ok, frame = self.cap.read()
+            if ok:
+                fails = 0
+                with self.lock:
+                    self.frame, self.count = frame, self.count + 1
+                continue
+            fails += 1
+            if fails > 30:          # about a minute without a picture: give up
+                self.alive = False
+                break
+            time.sleep(2.0)
+            self.cap.release()
+            self.cap = cv2.VideoCapture(self.source)
+
+    def read(self, last_count: int):
+        """Wait for a frame newer than last_count. Returns (frame, count), frame is None at the end."""
+        while self.alive:
+            with self.lock:
+                if self.frame is not None and self.count != last_count:
+                    return self.frame, self.count
+            time.sleep(0.005)
+        return None, last_count
+
+    def release(self):
+        self.alive = False
+        self.cap.release()
+
+
+def write_atomic(path: Path, data: bytes):
+    """Write so that a reader (the dashboard) never sees a half-written file."""
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_bytes(data)
+    try:
+        tmp.replace(path)
+    except OSError:
+        pass   # the dashboard is reading it this instant; the next update will go through
+
+
 def main():
     ap = argparse.ArgumentParser(description="Phone snatching detector for stations")
     ap.add_argument("--source", required=True, help="video file, camera index or RTSP url")
     ap.add_argument("--out", default="output")
+    ap.add_argument("--name", default=None, help="camera / video name shown on the dashboard")
     ap.add_argument("--pose-model", default="yolo11s-pose.pt")
     ap.add_argument("--phone-model", default="yolo11s.pt")
-    ap.add_argument("--imgsz", type=int, default=960)
+    ap.add_argument("--imgsz", type=int, default=960, help="resolution for people / pose")
+    ap.add_argument("--phone-imgsz", type=int, default=1280, help="resolution for phones")
     ap.add_argument("--device", default=None, help="cpu, 0 (GPU) ...")
-    ap.add_argument("--stride", type=int, default=1, help="process every Nth frame (faster)")
+    ap.add_argument("--stride", type=int, default=1, help="video files: process every Nth frame")
     ap.add_argument("--show", action="store_true", help="show live window")
     ap.add_argument("--debug", action="store_true", help="print every watched contact")
     args = ap.parse_args()
 
     live = args.source.isdigit() or "://" in args.source
-    cap = cv2.VideoCapture(int(args.source) if args.source.isdigit() else args.source)
-    if not cap.isOpened():
-        raise SystemExit(f"Cannot open source: {args.source}")
-    fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
-    if not 1 <= fps <= 120:
-        fps = 25.0
-    out_fps = fps / args.stride
     out = Path(args.out)
-    det = TheftDetector(Config(), out, args.pose_model, args.phone_model, args.imgsz, args.device)
+    out.mkdir(parents=True, exist_ok=True)
+    stop_file, status_file, live_file = out / "stop", out / "status.json", out / "live.jpg"
+    stop_file.unlink(missing_ok=True)
+    # never show the user:password part of an RTSP url
+    name = args.name or (f"camera {args.source}" if args.source.isdigit()
+                         else args.source.split("@")[-1] if live else Path(args.source).name)
 
+    def status(state: str, **extra):
+        write_atomic(status_file, json.dumps(dict(state=state, source=name, live=live, **extra)).encode())
+
+    status("starting")
+    if live:
+        reader = LiveReader(args.source)
+        cap, fps, total = reader.cap, 0.0, 0
+    else:
+        reader = None
+        cap = cv2.VideoCapture(args.source)
+        fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
+        if not 1 <= fps <= 120:
+            fps = 25.0
+        total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    if not cap.isOpened():
+        status("error", message=f"Cannot open source: {name}")
+        raise SystemExit(f"Cannot open source: {name}")
+
+    det = TheftDetector(Config(), out, args.pose_model, args.phone_model, args.imgsz, args.device,
+                        args.phone_imgsz)
+    det.source_name = name
     writer = None
-    n, t = 0, 0.0
-    t_start = time.time()
-    while True:
-        ok, frame = cap.read()
-        if not ok:
-            break
-        n += 1
-        if (n - 1) % args.stride:
-            continue
-        t = time.time() - t_start if live else (n - 1) / fps
-        img = det.step(frame, t, out_fps)
-        if writer is None:
-            writer = cv2.VideoWriter(str(out / "annotated.mp4"), cv2.VideoWriter_fourcc(*"mp4v"),
-                                     out_fps, (img.shape[1], img.shape[0]))
-        writer.write(img)
+    n, t, done, count = 0, 0.0, 0, 0
+    t_start = t_status = time.time()
+    while not stop_file.exists():
+        if live:
+            frame, count = reader.read(count)
+            if frame is None:
+                break
+            n, t = count, time.time() - t_start
+        else:
+            ok, frame = cap.read()
+            if not ok:
+                break
+            n += 1
+            if (n - 1) % args.stride:
+                continue
+            t = (n - 1) / fps
+        img = det.step(frame, t)
+        done += 1
+        if not live:
+            # a camera runs forever, so only video files get a full annotated copy
+            if writer is None:
+                writer = cv2.VideoWriter(str(out / "annotated.mp4"), cv2.VideoWriter_fourcc(*"mp4v"),
+                                         fps / args.stride, (img.shape[1], img.shape[0]))
+            writer.write(img)
+        now = time.time()
+        if now - t_status >= 0.5:          # feed the dashboard: live picture + progress
+            t_status = now
+            ok, jpg = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, 70])
+            if ok:
+                write_atomic(live_file, jpg.tobytes())
+            status("running", frame=n, total=total, alerts=len(det.alerts),
+                   speed=round(done / (now - t_start), 1), people=len(det.tracks))
         if args.show:
             cv2.imshow("station theft detector (q = quit)", img)
             if cv2.waitKey(1) & 0xFF == ord("q"):
                 break
-    det._finish_events(t, out_fps, force=True)
-    cap.release()
+    det._finish_events(t, force=True)
+    if reader is not None:
+        reader.release()
+    else:
+        cap.release()
     if writer is not None:
         writer.release()
     cv2.destroyAllWindows()
+    stopped = stop_file.exists()
+    stop_file.unlink(missing_ok=True)
+    status("stopped" if stopped else "finished", frame=n, total=total, alerts=len(det.alerts))
 
     if args.debug:
         top = sorted(((max(s.speed for s in tr.hist), tid) for tid, tr in det.tracks.items()), reverse=True)
