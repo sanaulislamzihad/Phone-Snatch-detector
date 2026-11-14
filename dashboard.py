@@ -250,15 +250,20 @@ PAGE = r"""<!doctype html>
 
   @media (max-width:1000px) { .tiles { grid-template-columns:repeat(2, 1fr); } .two, .m-body { grid-template-columns:1fr; } }
   @media (max-width:900px) {
-    .app { grid-template-columns:1fr; }
-    aside { position:static; height:auto; padding:12px 16px; }
+    .app { grid-template-columns:minmax(0, 1fr); }
+    aside { position:static; height:auto; padding:12px 16px; min-width:0; }
     .brand { border:0; padding:0 0 10px; margin:0; }
     nav { display:flex; gap:4px; overflow-x:auto; }
     .side-status { display:none; }
     main { padding:20px 16px 40px; }
     .options { grid-template-columns:1fr; }
   }
-  @media (max-width:480px) { .fields { grid-template-columns:1fr; } .filters .f { min-width:0; width:100%; } .filters .meta { margin-left:0; } }
+  @media (max-width:480px) {
+    .fields { grid-template-columns:minmax(0, 1fr); }
+    .fields .wide { flex-direction:column; }
+    .filters .f { min-width:0; width:100%; } .filters .meta { margin-left:0; }
+    .pair { gap:8px; } .ph { width:80px; height:80px; }
+  }
 </style></head><body>
 <div class="app">
   <aside>
@@ -421,7 +426,13 @@ function note(text, err) { const n = $("#note"); n.textContent = text || ""; n.c
 /* ---------- views ---------- */
 const VIEWS = ["overview", "watch", "live", "videos"];
 function route() {
-  const h = location.hash.slice(1);
+  let h = location.hash.slice(1);
+  if (h.startsWith("inspect=")) {          // direct link to one event: #inspect=<event id>
+    S.pending = decodeURIComponent(h.slice(8));
+    history.replaceState(null, "", "#watch");
+    h = "watch";
+    if (S.events.length) openPending();
+  }
   S.view = VIEWS.includes(h) ? h : "watch";
   for (const v of VIEWS) {
     $("#v-" + v).hidden = v !== S.view;
@@ -637,6 +648,11 @@ async function loadEvents() {
   if (sig === S.sig) return;          // nothing changed: leave the page alone
   S.sig = sig; S.events = events;
   renderAll();
+  openPending();
+}
+function openPending() {
+  if (S.pending && S.events.some(e => e.id === S.pending)) inspect(S.pending);
+  S.pending = null;
 }
 
 function statusText(st) {
@@ -802,7 +818,10 @@ def make_handler(out: Path, jobs: Jobs):
             self.send_header("Content-Length", str(len(body)))
             self.send_header("Cache-Control", "no-store")
             self.end_headers()
-            self.wfile.write(body)
+            try:
+                self.wfile.write(body)
+            except (ConnectionAbortedError, ConnectionResetError, BrokenPipeError):
+                pass   # the browser left the page or cancelled an image load: nothing to do
 
         def _json(self, obj, code: int = 200):
             self._send(code, json.dumps(obj).encode(), "application/json")
