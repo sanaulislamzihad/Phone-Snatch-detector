@@ -92,11 +92,38 @@ flowchart LR
 | **Victim had phone** | 0.20 | Phone attached to the victim's wrist during the 3 s before the contact |
 | **Phone changed hands** | 0.15 | Phone appears at the suspect's wrist after the contact, or disappears from the victim |
 
+A pair of people is watched when either of two things happens:
+
+- **Hand contact** - one person's wrist comes within 0.2 body heights of the other's.
+- **Phone appears** - a phone suddenly shows up in someone's hand (none there for the previous
+  1.5 s) right next to a person who held one a moment ago. A thief reaching over a bench from
+  behind is half hidden and the pose model often misplaces his wrists, so hand contact is never
+  seen; the phone moving is.
+
 An alert needs a score of at least **0.55** and one of two patterns:
 
-- **Sprint** - the suspect clearly runs away, and the victim either reacts or was holding a phone.
+- **Sprint** - the suspect bolts (runs at least 0.5 body heights/s faster than just before the
+  contact), a phone was seen at the victim, and the victim reacts or the phone is seen in the
+  suspect's hand at least 0.5 body heights away from the victim's hands (carried away). A thief
+  stops or slows down to grab and leaves with the phone; when someone running for a train brushes
+  past people holding phones, the phones never leave their owners.
 - **Grab** - the phone is seen changing hands, the victim reacts strongly, and the taker leaves.
   This covers a thief running straight away from the camera, whose speed in the image looks small.
+
+The suspect must have been tracked for at least 1.5 s before the contact: without that there is
+no way to tell whether they slowed down to grab, or already had the phone in their own hand.
+
+The suspect is always the one who moved further from the contact point, so a thief's own
+sprint is never counted as a "victim reaction". When two people next to the thief both held a
+phone, the one whose phone is gone afterwards is reported as the victim.
+
+### Tracking through a grab
+
+A thief who bends over a bench and then sprints changes shape and speed so fast that ByteTrack
+can give him a new ID several times in half a second. A new ID that appears within about a
+second where a lost person is expected to be (their last position plus their velocity), with a
+similar body size, continues that person, so their history - phone in hand, face shots - is
+kept. If the tracker later brings back the original ID, the two are separated again.
 
 Speeds and distances are normalised by each person's body height, so the same thresholds work
 for people near to and far from the camera.
@@ -261,8 +288,8 @@ automatically the first time the dashboard starts.
 
 ## Configuration
 
-All settings are on the dashboard's **Settings** page; defaults live in the `Config` dataclass at
-the top of `detect.py`.
+The main settings are on the dashboard's **Settings** page; every value, with its default, lives
+in the `Config` dataclass at the top of `detect.py`.
 
 | Setting | Default | Meaning |
 |---------|:-------:|---------|
@@ -272,10 +299,13 @@ the top of `detect.py`.
 | `walk_speed` / `run_speed` | 0.9 / 2.0 | Body-heights per second that count as walking / running |
 | `flee_min_speed` | 1.4 | Minimum peak speed for the sprint pattern |
 | `flee_min_dist` | 0.9 | Body-heights the suspect must move away from the contact point |
+| `flee_speed_up` | 0.5 | How much faster than just before the contact the suspect must run (body-heights/s) |
 | `contact_dist` | 0.20 | Hand-to-hand distance (x body height) that counts as contact |
 | `watch_seconds` | 3.5 | How long a contact is watched |
 | `phone_conf` / `phone_conf_hand` | 0.25 / 0.05 | Phone confidence needed anywhere / at a wrist |
 | `phone_wrist_dist` | 0.22 | Phone-to-wrist distance (x body height) that counts as holding |
+| `carry_dist` | 0.5 | A phone this far (x body height) from the victim's hands has left the victim |
+| `min_seen_before` | 1.5 | Seconds the suspect must be tracked before the contact |
 
 ## Performance
 
@@ -302,7 +332,8 @@ No configuration produced phone boxes away from people's hands on these frames.
 | Measurement | Result |
 |-------------|--------|
 | Processing speed, whole pipeline | about 1 frame per second |
-| Snatch detected when processing 24 frames/s (YOLO26s) | 2 of 2 test clips |
+| Third test clip | thief reaches over a bench from behind and sprints to a train; later a man runs past the same bench holding his own phone - only the thief is flagged |
+| Snatch detected when processing 24 frames/s (YOLO26s) | 3 of 3 test clips, correct suspect in each, no false alerts |
 | Snatch detected when processing 8 frames/s (measured with YOLO11s) | 2 of 2 test clips |
 | Snatch detected when processing 4 frames/s (measured with YOLO11s) | 0 of 2 test clips |
 
@@ -320,6 +351,8 @@ videos are analysed correctly (slower than real time), but a live camera needs a
 - **Face quality** depends on camera position and resolution. A cap, hood, mask or a face turned away gives a poor capture.
 - **One analysis at a time.** Further videos wait in a queue; a suspect is not followed from one camera to another.
 - **Identity switches** in dense crowds can split one person into two tracks and lose evidence.
+- **A thief who appears less than 1.5 s before the grab** (stepping out from behind a pillar or entering at the frame edge) is not flagged.
+- **Edited videos** with scene cuts confuse tracking; the system is built for continuous CCTV footage.
 - **YOLOE models** need the `clip` package; Ultralytics installs it automatically the first time one is selected.
 
 ## Responsible use
