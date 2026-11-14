@@ -45,6 +45,7 @@ class Config:
     run_speed: float = 2.0           # clearly running -> flee score 1.0
     flee_min_speed: float = 1.4      # below this nobody is "fleeing"
     flee_min_dist: float = 0.9       # runner must get this far from the contact point
+    flee_speed_up: float = 0.5       # ... and run this much faster than just before the contact
     speed_window: float = 0.4        # seconds used to measure speed
     contact_dist: float = 0.20       # hand-to-hand distance (x body height) that counts as contact
     phone_wrist_dist: float = 0.22   # phone-to-wrist distance (x body height) for "holding"
@@ -52,6 +53,12 @@ class Config:
     phone_conf_hand: float = 0.05    # lower confidence accepted for a box right at a wrist
     watch_seconds: float = 3.5       # how long a contact is watched
     before_seconds: float = 3.0      # history looked at before the contact
+    relink_seconds: float = 1.0      # a new tracker ID may continue a person lost this recently
+    relink_dist: float = 0.6         # ... if it appears within this many body heights of where expected
+    grab_window: float = 1.5         # a phone is "new" in a hand if it was not there for this long
+    grab_dist: float = 1.2           # ... and the person who just held one is this close (body heights)
+    carry_dist: float = 0.5          # a phone this far from the victim's hands has left the victim
+    min_seen_before: float = 1.5     # the suspect must be tracked this long before the contact (s)
     alert_score: float = 0.55
     kpt_conf: float = 0.3
     clip_before: float = 3.0
@@ -66,7 +73,9 @@ class Sample:
     box: np.ndarray
     kpts: np.ndarray
     speed: float = 0.0
+    speed_ok: bool = False   # False for the first samples of a track, before speed can be measured
     phone: bool = False
+    phone_pos: np.ndarray | None = None   # centre of the phone in this person's hand
 
 
 @dataclass
@@ -137,6 +146,7 @@ class TheftDetector:
         self.live = False
         self.device = device
         self.tracks: dict[int, Track] = {}
+        self.alias: dict[int, int] = {}   # tracker ID -> person (see _resolve_id)
         self.events: dict[tuple[int, int], Event] = {}
         self.alerts: list[Event] = []
         self.buffer: deque = deque()   # (t, jpeg bytes) of annotated frames
@@ -161,9 +171,19 @@ class TheftDetector:
                             imgsz=self.imgsz, device=self.device, verbose=False)[0]
         ids: list[int] = []
         if r.boxes.id is not None:
-            boxes = r.boxes.xyxy.cpu().numpy()
-            kpts = r.keypoints.data.cpu().numpy()
-            for box, k, tid in zip(boxes, kpts, r.boxes.id.int().tolist()):
+            dets = list(zip(r.boxes.xyxy.cpu().numpy(), r.keypoints.data.cpu().numpy(),
+                            r.boxes.id.int().tolist()))
+            # people under their own tracker ID first, then IDs we continued, then new IDs: a lost
+            # person is known to be lost before a new ID is matched against them, and a person
+            # the tracker brings back keeps their number
+            def order(d):
+                tid = self.alias.get(d[2])
+                if tid is None and d[2] not in self.tracks:
+                    return 2
+                return 0 if tid in (None, d[2]) else 1
+            dets.sort(key=order)
+            for box, k, raw in dets:
+                tid = self._resolve_id(raw, box, k, t, ids)
                 self._update_track(tid, t, box, k, frame)
                 ids.append(tid)
 
@@ -174,15 +194,53 @@ class TheftDetector:
         self._assign_phones(ids, d.boxes.xyxy.cpu().numpy(), d.boxes.conf.cpu().numpy())
         return ids
 
+    def _position(self, box: np.ndarray, k: np.ndarray) -> np.ndarray:
+        """Hip centre when visible (steadier than the box), else the box centre."""
+        hips = k[[LHIP, RHIP]]
+        if (hips[:, 2] > self.cfg.kpt_conf).all():
+            return hips[:, :2].mean(axis=0).astype(float)
+        return np.array([(box[0] + box[2]) / 2, (box[1] + box[3]) / 2], dtype=float)
+
+    def _resolve_id(self, raw: int, box: np.ndarray, k: np.ndarray, t: float, taken: list[int]) -> int:
+        """Map a tracker ID to a person, continuing a person the tracker has just lost.
+
+        A thief who bends over a bench and then sprints changes shape and speed so fast that
+        ByteTrack often gives him a new ID (seen: three IDs in half a second). A new ID that
+        appears where a lost person is expected to be, with a similar size, continues that
+        person, so their history (phone in hand, face shots) is not lost.
+        """
+        if raw in self.alias or raw in self.tracks:
+            tid = self.alias.get(raw, raw)
+            if tid in taken:
+                # ByteTrack brought back the person we had continued under this new ID, so the
+                # new ID is somebody else after all: give it its own number
+                self.alias[raw] = raw
+                return raw
+            return tid
+        cfg = self.cfg
+        pos, h = self._position(box, k), float(box[3] - box[1])
+        best, best_d = None, 1e9
+        for tr in self.tracks.values():
+            gap = t - tr.last.t
+            if tr.id in taken or not 0 < gap <= cfg.relink_seconds:
+                continue
+            scale = max(tr.scale(), 1.0)
+            if not 0.75 < h / scale < 1.33:
+                continue
+            # where the person should be now, at their last velocity
+            old = next((p for p in reversed(tr.hist) if tr.last.t - p.t >= 0.25), None)
+            vel = (tr.last.pos - old.pos) / (tr.last.t - old.t) if old is not None else np.zeros(2)
+            d = float(np.linalg.norm(pos - (tr.last.pos + vel * gap))) / scale
+            if d <= cfg.relink_dist + 1.0 * gap and d < best_d:
+                best, best_d = tr, d
+        tid = best.id if best is not None else raw
+        self.alias[raw] = tid
+        return tid
+
     def _update_track(self, tid: int, t: float, box: np.ndarray, k: np.ndarray, frame: np.ndarray):
         tr = self.tracks.setdefault(tid, Track(tid))
         h = float(box[3] - box[1])
-        hips = k[[LHIP, RHIP]]
-        if (hips[:, 2] > self.cfg.kpt_conf).all():
-            pos = hips[:, :2].mean(axis=0)
-        else:
-            pos = np.array([(box[0] + box[2]) / 2, (box[1] + box[3]) / 2])
-        s = Sample(t, pos.astype(float), h, box, k)
+        s = Sample(t, self._position(box, k), h, box, k)
         tr.hist.append(s)
         # speed over a short window, normalised by body height
         old = None
@@ -192,6 +250,7 @@ class TheftDetector:
                 break
         if old is not None and t - old.t < 3 * self.cfg.speed_window:
             s.speed = self._dist(tr, old, s) / (t - old.t)
+            s.speed_ok = True
         self._update_face(tr, s, frame)
 
     @staticmethod
@@ -229,16 +288,21 @@ class TheftDetector:
         for i in kept:
             pb, conf = boxes[i], confs[i]
             c = np.array([(pb[0] + pb[2]) / 2, (pb[1] + pb[3]) / 2])
-            best, best_d = None, 1e9
+            near: list[tuple[float, Sample]] = []
             for tid in ids:
                 tr = self.tracks[tid]
                 s = tr.last
-                for w in self._hands(s):
-                    d = np.linalg.norm(w - c) / max(tr.scale(), 1.0)
-                    if d < best_d:
-                        best, best_d = s, d
-            if best is not None and best_d < self.cfg.phone_wrist_dist:
-                best.phone = True
+                ds = [np.linalg.norm(w - c) / max(tr.scale(), 1.0) for w in self._hands(s)]
+                if ds and min(ds) < self.cfg.phone_wrist_dist:
+                    near.append((float(min(ds)), s))
+            if near:
+                # people sitting side by side have their hands almost on top of each other: when two
+                # wrists are about equally close, the phone counts for both rather than a guess
+                best_d = min(d for d, _ in near)
+                for d, s in near:
+                    if d <= 1.35 * best_d:
+                        s.phone = True
+                        s.phone_pos = c
                 self.phones.append((pb, True))
             elif conf >= self.cfg.phone_conf:
                 self.phones.append((pb, False))
@@ -302,6 +366,8 @@ class TheftDetector:
             sa = self.tracks[a].last
             ha = self._hands(sa)
             for b in ids[i + 1:]:
+                if b == a:
+                    continue
                 sb = self.tracks[b].last
                 # quick reject: boxes (slightly grown) must overlap
                 m = 0.15 * max(sa.h, sb.h)
@@ -314,12 +380,56 @@ class TheftDetector:
                 d = min(np.linalg.norm(p - q) for p in ha for q in hb)
                 if d / max(self.tracks[a].scale(), self.tracks[b].scale(), 1.0) > cfg.contact_dist:
                     continue
-                key = (a, b)
-                ev = self.events.get(key)
-                if ev is None or ev.done:
-                    self.events[key] = Event(a, b, t, t)
-                elif not ev.alerted:
-                    ev.t1 = t
+                self._touch(a, b, t)
+
+    def _touch(self, a: int, b: int, t: float):
+        """Start watching the pair (a, b), or extend the contact if it is already watched."""
+        key = (a, b) if (a, b) in self.events or (b, a) not in self.events else (b, a)
+        ev = self.events.get(key)
+        if ev is None or ev.done:
+            self.events[key] = Event(key[0], key[1], t, t)
+        elif not ev.alerted:
+            ev.t1 = t
+
+    def _find_grabs(self, ids: list[int], t: float):
+        """A phone that suddenly appears in someone's hand next to a person who just held one.
+
+        A thief reaching over a bench from behind is half hidden, and the pose model often puts
+        his wrists far from where his hands really are, so hand-to-hand contact is never seen.
+        The phone itself moving from one person to the next is the other sign of a grab.
+        """
+        cfg = self.cfg
+        for q in ids:
+            Q = self.tracks[q]
+            if not Q.last.phone:
+                continue
+            before = Q.between(t - cfg.grab_window, t - 1e-6)
+            if len(before) < 3 or any(x.phone for x in before):
+                continue   # no history yet, or the phone was already in this person's hand
+            for p in ids:
+                if p == q:
+                    continue
+                P = self.tracks[p]
+                d = float(np.linalg.norm(P.last.pos - Q.last.pos)) / max(P.scale(), Q.scale(), 1.0)
+                if d <= cfg.grab_dist and any(x.phone for x in P.between(t - 2.0, t)):
+                    self._touch(p, q, t)
+
+    def _carried_away(self, s_after: list[Sample], V: Track) -> bool:
+        """Was a phone seen in the suspect's hand away from the victim's hands?
+
+        When someone's hand merely passes over a victim's phone, the phone is briefly "at" both
+        people but never leaves the victim. A stolen phone is seen with the thief, apart from
+        the victim.
+        """
+        for x in s_after:
+            vx = V.at(x.t)
+            if x.phone_pos is None or vx is None:
+                continue
+            hands = self._hands(vx) or [vx.pos]
+            d = min(float(np.linalg.norm(x.phone_pos - h)) for h in hands) / max(V.scale(), 1.0)
+            if d >= self.cfg.carry_dist:
+                return True
+        return False
 
     # ----------------------------------------------------------------- scoring
     def _score(self, ev: Event, s_id: int, v_id: int, t: float) -> tuple[float, dict, bool]:
@@ -331,12 +441,27 @@ class TheftDetector:
         s_at = S.at(ev.t1)
         if not s_after or s_at is None:
             return 0.0, {}, False
+        # the suspect must have been seen for a while before the contact: without that there is
+        # no way to tell whether they slowed down to grab, or already had the phone themselves
+        if S.hist[0].t > ev.t0 - cfg.min_seen_before:
+            return 0.0, {}, False
 
         # --- flee: suspect sprints away from the contact point
         peak = max(x.speed for x in s_after)
         dist = max(self._dist(S, s_at, x) for x in s_after)
+        # the suspect is the one who leaves: if the other person went further, the roles are the
+        # other way round (otherwise the thief's own sprint would count as a "victim reaction")
+        v_at = V.at(ev.t1)
+        if v_at is not None and v_after and max(self._dist(V, v_at, x) for x in v_after) > dist:
+            return 0.0, {}, False
         flee = clip01((peak - cfg.walk_speed) / (cfg.run_speed - cfg.walk_speed))
-        flee_ok = peak >= cfg.flee_min_speed and dist >= cfg.flee_min_dist
+        # a thief stops or slows down to grab, then bolts; someone running for a train runs
+        # past at the same speed all the way, so the sprint must be a speed-up
+        # (someone first seen right at the contact has no "before": the speed-up is unknown)
+        pre = [x.speed for x in S.between(ev.t0 - 1.0, ev.t0) if x.speed_ok]
+        speed_up = peak - float(np.median(pre)) if len(pre) >= 3 else 0.0
+        flee_ok = (peak >= cfg.flee_min_speed and dist >= cfg.flee_min_dist
+                   and speed_up >= cfg.flee_speed_up)
 
         # --- victim reaction: speed burst, standing up, arm reaching toward the runner
         burst = stand = reach = 0.0
@@ -369,19 +494,24 @@ class TheftDetector:
 
         # --- phone evidence
         had_phone = clip01(sum(x.phone for x in v_before) / 4.0)
-        s_before = S.between(ev.t0 - 1.5, ev.t0)
+        s_before = S.between(ev.t0 - 1.5, ev.t0 - 1e-6)   # up to, not including, the grab itself
         s_new_phone = any(x.phone for x in s_after) and not any(x.phone for x in s_before)
         v_lost_phone = had_phone > 0 and len(v_after) >= 5 and not any(x.phone for x in v_after[-5:])
         # only meaningful if the victim really had a phone (the runner may carry their own)
         transfer = 0.0 if had_phone == 0 else (1.0 if s_new_phone else (0.6 if v_lost_phone else 0.0))
 
         score = 0.40 * flee + 0.25 * reaction + 0.20 * had_phone + 0.15 * transfer
-        parts = dict(flee=round(flee, 2), peak_speed=round(peak, 2), flee_dist=round(dist, 2),
+        carried = self._carried_away(s_after, V)
+        parts = dict(flee=round(flee, 2), peak_speed=round(peak, 2), speed_up=round(speed_up, 2),
+                     flee_dist=round(dist, 2),
                      reaction=round(reaction, 2), burst=round(burst, 2), stand=round(stand, 2),
-                     reach=round(reach, 2), had_phone=round(had_phone, 2), transfer=transfer)
-        # Path A: a clear sprint. Running alone is never enough: the victim must react or
-        #         must have been holding a phone.
-        sprint = flee_ok and (reaction >= 0.3 or had_phone >= 0.5)
+                     reach=round(reach, 2), had_phone=round(had_phone, 2), transfer=transfer,
+                     victim_lost_phone=int(v_lost_phone), carried=int(carried))
+        # Path A: a clear sprint. Running past people is never enough (people run for trains,
+        #         and many of the people they pass hold a phone): there must be a phone at the
+        #         victim, and the victim must react or the phone must be seen moving.
+        phone_seen = had_phone >= 0.25 or transfer > 0
+        sprint = flee_ok and phone_seen and (reaction >= 0.3 or carried)
         # Path B: the phone visibly changed hands, the victim reacts strongly and the taker
         #         leaves. Covers a thief running straight away from the camera, where the
         #         speed in the image looks small. A friendly hand-over has no strong reaction.
@@ -413,7 +543,10 @@ class TheftDetector:
         # one alert per suspect; if a later contact fits better, it only corrects the victim
         for e in self.alerts:
             if e.suspect == ev.suspect and e is not ev:
-                if ev.score > e.score and not e.done:
+                # two people next to the thief may both have held a phone: the one whose phone
+                # is gone afterwards is the victim
+                rank = lambda x: x.score + 0.05 * x.parts.get("victim_lost_phone", 0)  # noqa: E731
+                if rank(ev) > rank(e) and not e.done:
                     e.victim, e.score, e.parts, e.t0 = ev.victim, ev.score, ev.parts, ev.t0
                     print(f"[ALERT] victim corrected to #{e.victim}  score={e.score:.2f}  {e.parts}")
                     self._save_event(e)
@@ -518,6 +651,7 @@ class TheftDetector:
     def step(self, frame: np.ndarray, t: float) -> np.ndarray:
         ids = self._infer(frame, t)
         self._find_contacts(ids, t)
+        self._find_grabs(ids, t)
         self._evaluate(t, frame)
         # keep refreshing the suspect's best face while they are still visible
         img = self._draw(frame, ids, t)
