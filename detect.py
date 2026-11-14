@@ -48,6 +48,8 @@ class Config:
     speed_window: float = 0.4        # seconds used to measure speed
     contact_dist: float = 0.20       # hand-to-hand distance (x body height) that counts as contact
     phone_wrist_dist: float = 0.22   # phone-to-wrist distance (x body height) for "holding"
+    phone_conf: float = 0.25         # confidence a phone box needs anywhere in the picture
+    phone_conf_hand: float = 0.05    # lower confidence accepted for a box right at a wrist
     watch_seconds: float = 3.5       # how long a contact is watched
     before_seconds: float = 3.0      # history looked at before the contact
     alert_score: float = 0.55
@@ -127,6 +129,7 @@ class TheftDetector:
         (out_dir / "events").mkdir(parents=True, exist_ok=True)
         self.pose = YOLO(pose_weights)
         self.det = YOLO(det_weights)
+        self.phone_classes = self._phone_classes(det_weights)
         self.imgsz = imgsz
         self.phone_imgsz = phone_imgsz
         self.source_name = ""
@@ -137,9 +140,22 @@ class TheftDetector:
         self.events: dict[tuple[int, int], Event] = {}
         self.alerts: list[Event] = []
         self.buffer: deque = deque()   # (t, jpeg bytes) of annotated frames
-        self.phones: list[np.ndarray] = []
+        self.phones: list[tuple[np.ndarray, bool]] = []   # (box, held by someone)
 
     # ------------------------------------------------------------------ models
+    def _phone_classes(self, weights: str) -> list[int] | None:
+        """Class ids that mean 'phone' for this model (None = every class is a phone)."""
+        if "yoloe" in Path(weights).name.lower():
+            # open-vocabulary model: tell it in words what to look for
+            prompts = ["cell phone", "smartphone", "mobile phone"]
+            self.det.set_classes(prompts, self.det.get_text_pe(prompts))
+            return None
+        ids = [i for i, n in self.det.names.items()
+               if str(n).lower() in ("cell phone", "mobile phone", "phone", "smartphone")]
+        if not ids:
+            raise SystemExit(f"{weights} has no phone class")
+        return ids
+
     def _infer(self, frame: np.ndarray, t: float) -> list[int]:
         r = self.pose.track(frame, persist=True, tracker="bytetrack.yaml", conf=0.25,
                             imgsz=self.imgsz, device=self.device, verbose=False)[0]
@@ -153,10 +169,9 @@ class TheftDetector:
 
         # phones are only 10-20 px in a station camera, so the phone model runs at a higher
         # resolution than the pose model (measured: far more phones found at 1280 than 960)
-        d = self.det.predict(frame, classes=[PHONE_CLASS], conf=0.12, imgsz=self.phone_imgsz,
-                             device=self.device, verbose=False)[0]
-        self.phones = list(d.boxes.xyxy.cpu().numpy())
-        self._assign_phones(ids)
+        d = self.det.predict(frame, classes=self.phone_classes, conf=self.cfg.phone_conf_hand,
+                             imgsz=self.phone_imgsz, device=self.device, verbose=False)[0]
+        self._assign_phones(ids, d.boxes.xyxy.cpu().numpy(), d.boxes.conf.cpu().numpy())
         return ids
 
     def _update_track(self, tid: int, t: float, box: np.ndarray, k: np.ndarray, frame: np.ndarray):
@@ -187,8 +202,32 @@ class TheftDetector:
     def _hands(self, s: Sample) -> list[np.ndarray]:
         return [s.kpts[i, :2] for i in (LWR, RWR) if s.kpts[i, 2] > self.cfg.kpt_conf]
 
-    def _assign_phones(self, ids: list[int]):
-        for pb in self.phones:
+    @staticmethod
+    def _overlap(a: np.ndarray, b: np.ndarray) -> float:
+        """Intersection divided by the smaller box's area (1.0 = one box inside the other)."""
+        w = min(a[2], b[2]) - max(a[0], b[0])
+        h = min(a[3], b[3]) - max(a[1], b[1])
+        if w <= 0 or h <= 0:
+            return 0.0
+        small = min((a[2] - a[0]) * (a[3] - a[1]), (b[2] - b[0]) * (b[3] - b[1]))
+        return float(w * h / max(small, 1e-6))
+
+    def _assign_phones(self, ids: list[int], boxes: np.ndarray, confs: np.ndarray):
+        """Attach each phone box to the nearest wrist.
+
+        A phone held in the hand is small and partly covered by fingers, so the detector is often
+        unsure about it. A weak box (down to phone_conf_hand) is trusted only when it sits right
+        at someone's wrist; anywhere else a box needs phone_conf to count.
+        """
+        self.phones = []
+        # YOLO26 has no NMS step, so one phone can come with weaker boxes on top of it:
+        # keep the strongest box and drop any box that mostly overlaps a stronger one
+        kept: list[int] = []
+        for i in np.argsort(-confs):
+            if not any(self._overlap(boxes[i], boxes[k]) > 0.5 for k in kept):
+                kept.append(int(i))
+        for i in kept:
+            pb, conf = boxes[i], confs[i]
             c = np.array([(pb[0] + pb[2]) / 2, (pb[1] + pb[3]) / 2])
             best, best_d = None, 1e9
             for tid in ids:
@@ -200,6 +239,9 @@ class TheftDetector:
                         best, best_d = s, d
             if best is not None and best_d < self.cfg.phone_wrist_dist:
                 best.phone = True
+                self.phones.append((pb, True))
+            elif conf >= self.cfg.phone_conf:
+                self.phones.append((pb, False))
 
     # ------------------------------------------------------------------- faces
     def _update_face(self, tr: Track, s: Sample, frame: np.ndarray):
@@ -453,7 +495,7 @@ class TheftDetector:
         img = frame.copy()
         suspects = {e.suspect for e in self.alerts}
         victims = {e.victim for e in self.alerts}
-        for pb in self.phones:
+        for pb, _ in self.phones:
             cv2.rectangle(img, (int(pb[0]), int(pb[1])), (int(pb[2]), int(pb[3])), (0, 255, 255), 2)
         for tid in ids:
             s = self.tracks[tid].last
@@ -550,6 +592,25 @@ def write_atomic(path: Path, data: bytes):
         pass   # the dashboard is reading it this instant; the next update will go through
 
 
+MODEL_ARGS = ("pose_model", "phone_model", "imgsz", "phone_imgsz", "device", "stride")
+
+
+def load_settings(args) -> Config:
+    """Config with the values of --settings applied; model choices in it override the CLI."""
+    cfg = Config()
+    if not args.settings:
+        return cfg
+    data = json.loads(Path(args.settings).read_text())
+    for key, value in data.items():
+        if key in MODEL_ARGS:
+            if key == "device":
+                value = None if value in ("", "auto", None) else str(value)
+            setattr(args, key, value)
+        elif hasattr(cfg, key):
+            setattr(cfg, key, type(getattr(cfg, key))(value))
+    return cfg
+
+
 def main():
     ap = argparse.ArgumentParser(description="Phone snatching detector for stations")
     ap.add_argument("--source", required=True, help="video file, camera index or RTSP url")
@@ -557,14 +618,17 @@ def main():
     ap.add_argument("--name", default=None, help="camera / video name shown on the dashboard")
     ap.add_argument("--location", default="", help="where the camera is, e.g. 'Platform 2'")
     ap.add_argument("--pose-model", default="yolo11s-pose.pt")
-    ap.add_argument("--phone-model", default="yolo11s.pt")
+    ap.add_argument("--phone-model", default="yolo26s.pt")
     ap.add_argument("--imgsz", type=int, default=960, help="resolution for people / pose")
     ap.add_argument("--phone-imgsz", type=int, default=1280, help="resolution for phones")
     ap.add_argument("--device", default=None, help="cpu, 0 (GPU) ...")
     ap.add_argument("--stride", type=int, default=1, help="video files: process every Nth frame")
     ap.add_argument("--show", action="store_true", help="show live window")
     ap.add_argument("--debug", action="store_true", help="print every watched contact")
+    ap.add_argument("--settings", default=None,
+                    help="JSON file with Config values and model choices (written by the dashboard)")
     args = ap.parse_args()
+    cfg = load_settings(args)
 
     live = args.source.isdigit() or "://" in args.source
     out = Path(args.out)
@@ -593,7 +657,7 @@ def main():
         status("error", message=f"Cannot open source: {name}")
         raise SystemExit(f"Cannot open source: {name}")
 
-    det = TheftDetector(Config(), out, args.pose_model, args.phone_model, args.imgsz, args.device,
+    det = TheftDetector(cfg, out, args.pose_model, args.phone_model, args.imgsz, args.device,
                         args.phone_imgsz)
     det.source_name = name
     det.location = args.location[:60]
