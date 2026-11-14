@@ -3,3 +3,4 @@ __pycache__/
 output/
 *.pt
 *.mp4
+mobileclip*.ts
