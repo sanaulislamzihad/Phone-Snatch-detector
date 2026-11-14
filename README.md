@@ -133,7 +133,7 @@ for people near to and far from the camera.
 A phone held in the hand is 10-25 pixels on a station camera and partly covered by fingers.
 Three things make it visible to the system:
 
-- **YOLO26s** as the phone detector. On the test clips it finds clearly more held phones than YOLO11s, and runs faster (see [Performance](#performance)).
+- **YOLO26s** as the phone detector. On the test clips it found 46 of 48 held phones against 35 for YOLO11s, and runs faster.
 - **1280 px** inference resolution for phones, higher than the 960 px used for people.
 - **Wrist-guided threshold** - a box needs 25 % confidence anywhere in the picture, but only 5 % when it sits at someone's wrist. A weak box at a hand is almost always a real phone; elsewhere it is usually noise.
 
@@ -157,7 +157,7 @@ dashboard.py       dashboard server: analyses queue, videos, cameras, events, se
 web/               dashboard page: index.html, app.css, app.js (no build step)
 requirements.txt
 docs/              screenshots used in this README
-output/            created at run time, see Output
+output/            created at run time: uploaded videos, analyses, events, settings
 ```
 
 ## Installation
@@ -220,127 +220,6 @@ Camera passwords are never sent to the page.
 .venv\Scripts\python detect.py --source rtsp://user:password@192.168.1.10:554/stream1 --name "CAM 03" --location "Platform 2" --show
 .venv\Scripts\python detect.py --source 0 --show
 ```
-
-| Option | Default | Description |
-|--------|---------|-------------|
-| `--source` | required | Video file, camera index, or RTSP / HTTP stream address |
-| `--out` | `output` | Output folder |
-| `--name` | source name | Camera or video name stored with each event |
-| `--location` | empty | Where the camera is, e.g. `Platform 2` |
-| `--pose-model` | `yolo11s-pose.pt` | Person / keypoint model |
-| `--phone-model` | `yolo26s.pt` | Phone model: any COCO detector, or a YOLOE model (searched with the words "cell phone", "smartphone", "mobile phone") |
-| `--imgsz` | `960` | Inference resolution for people |
-| `--phone-imgsz` | `1280` | Inference resolution for phones |
-| `--device` | auto | `cpu`, or a GPU index such as `0` |
-| `--stride` | `1` | Video files: process every Nth frame |
-| `--settings` | none | JSON file with model choices and `Config` values (the dashboard writes one per analysis) |
-| `--show` | off | Show a live window (`q` to quit) |
-| `--debug` | off | Print the score of every watched contact |
-
-## Output
-
-```
-output/
-  settings.json                      settings for new analyses (Settings page)
-  cameras.json                       saved CCTV cameras
-  videos/<id>/                       uploaded video + video.json
-  jobs/<id>/                         one analysis
-    job.json                         source, status, times
-    settings.json                    settings this analysis ran with
-    annotated.mp4                    scanned video (video files only)
-    live.jpg, status.json            live picture and progress while running
-    detector.log
-    events/event_<date>_<time>_001/
-      suspect_face.jpg               best face of the suspect
-      suspect_face_2.jpg ... _4.jpg  next best faces, from other moments
-      suspect_body.jpg
-      victim_face.jpg                best face of the victim
-      victim.jpg
-      alert_frame.jpg                full frame at the alert, suspect outlined
-      clip.mp4                       from 3 s before the contact to 3 s after the alert
-      event.json                     what was detected
-      review.json                    operator's decision and notes
-```
-
-`event.json`:
-
-```json
-{
-  "captured_at": "2026-11-14 13:07:45",
-  "source": "platform1_cam01.mp4",
-  "location": "Platform 1",
-  "live": false,
-  "video_time": 8.04,
-  "suspect_id": 4,
-  "victim_id": 1,
-  "contact_time": 6.54,
-  "alert_time": 8.04,
-  "score": 0.77,
-  "evidence": { "flee": 0.85, "reaction": 0.32, "had_phone": 1.0, "transfer": 1.0 },
-  "face_captured": true
-}
-```
-
-`review.json`: `{"status": "confirmed", "notes": "...", "at": "2026-11-14 13:20:10"}` - `status` is `new`, `confirmed`, `reviewed` or `dismissed`.
-
-Folders from older versions (`output/uploads`, `output/events`) are moved into this layout
-automatically the first time the dashboard starts.
-
-## Configuration
-
-The main settings are on the dashboard's **Settings** page; every value, with its default, lives
-in the `Config` dataclass at the top of `detect.py`.
-
-| Setting | Default | Meaning |
-|---------|:-------:|---------|
-| `phone_model` | `yolo26s.pt` | Phone detector |
-| `phone_imgsz` / `imgsz` | 1280 / 960 | Inference resolution for phones / people |
-| `alert_score` | 0.55 | Score needed for an alert |
-| `walk_speed` / `run_speed` | 0.9 / 2.0 | Body-heights per second that count as walking / running |
-| `flee_min_speed` | 1.4 | Minimum peak speed for the sprint pattern |
-| `flee_min_dist` | 0.9 | Body-heights the suspect must move away from the contact point |
-| `flee_speed_up` | 0.5 | How much faster than just before the contact the suspect must run (body-heights/s) |
-| `contact_dist` | 0.20 | Hand-to-hand distance (x body height) that counts as contact |
-| `watch_seconds` | 3.5 | How long a contact is watched |
-| `phone_conf` / `phone_conf_hand` | 0.25 / 0.05 | Phone confidence needed anywhere / at a wrist |
-| `phone_wrist_dist` | 0.22 | Phone-to-wrist distance (x body height) that counts as holding |
-| `carry_dist` | 0.5 | A phone this far (x body height) from the victim's hands has left the victim |
-| `min_seen_before` | 1.5 | Seconds the suspect must be tracked before the contact |
-
-## Performance
-
-Measured on the development machine (laptop CPU, no GPU), 1280x720 video, default settings.
-
-**Phone detection** - first 3 seconds of two clips in which two seated people each hold a phone,
-every 6th frame (24 frames, 48 phones). A phone counts as found when a box lands at the right wrist.
-
-| Phone model | Resolution | Phones found | Time per frame (phone model only) |
-|-------------|:----------:|:------------:|:---------------------------------:|
-| YOLO11s (previous default) | 1280 | 35 / 48 | 620 ms |
-| YOLO11s, 5 % threshold | 1280 | 43 / 48 | 460 ms |
-| **YOLO26s (default)** | **1280** | **46 / 48** | **416 ms** |
-| YOLO26m | 1280 | 46 / 48 | 1303 ms |
-| YOLO26l | 1280 | 46 / 48 | 1594 ms |
-| YOLO26s | 1920 | 46 / 48 | 1301 ms |
-| YOLOE-26s, text prompt "phone" | 1280 | 44 / 48 | 903 ms |
-| YOLOE-26m, text prompt "phone" | 1280 | 46 / 48 | 2618 ms |
-
-No configuration produced phone boxes away from people's hands on these frames.
-
-**Snatch detection**
-
-| Measurement | Result |
-|-------------|--------|
-| Processing speed, whole pipeline | about 1 frame per second |
-| Third test clip | thief reaches over a bench from behind and sprints to a train; later a man runs past the same bench holding his own phone - only the thief is flagged |
-| Snatch detected when processing 24 frames/s (YOLO26s) | 3 of 3 test clips, correct suspect in each, no false alerts |
-| Snatch detected when processing 8 frames/s (measured with YOLO11s) | 2 of 2 test clips |
-| Snatch detected when processing 4 frames/s (measured with YOLO11s) | 0 of 2 test clips |
-
-**Live cameras need about 8 processed frames per second or more.** A snatch lasts well under a
-second, and at lower rates the contact falls between frames. On a CPU-only machine recorded
-videos are analysed correctly (slower than real time), but a live camera needs an NVIDIA GPU
-(Settings → Processor).
 
 ## Limitations
 
