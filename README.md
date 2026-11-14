@@ -7,6 +7,16 @@ with automatic capture of the suspect's face.
 ![YOLO11](https://img.shields.io/badge/model-YOLO11-orange)
 ![License](https://img.shields.io/badge/license-MIT-green)
 
+## Screenshots
+
+**Detection** - the suspect is outlined in red the moment the snatch is confirmed; the stolen phone is boxed in yellow.
+
+![Annotated frame at the moment of the alert](docs/detection.jpg)
+
+**Dashboard** - live view, video upload, camera connection, and one card per captured event with the suspect's faces, capture time, evidence and clip.
+
+![Dashboard with two captured events](docs/dashboard.png)
+
 ## Overview
 
 A station camera sees dozens of phones at any moment, and people hand phones to friends all the
