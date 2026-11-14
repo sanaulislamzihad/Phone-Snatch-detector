@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Phone Snatch Detector</title>
+  <link rel="stylesheet" href="app.css">
+</head>
+<body>
+  <aside class="sidebar" id="sidebar">
+    <div class="brandbar">
+      <div class="logo" data-ic="shield" data-s="20"></div>
+      <div><div class="brand-name">Phone Snatch Detector</div><div class="brand-sub">Station theft monitoring</div></div>
+      <button class="close-nav" id="closeNav" aria-label="Close menu" data-ic="x" data-s="20"></button>
+    </div>
+    <nav class="nav" id="nav">
+      <a href="#/" data-route="overview" data-ic="dashboard" data-s="18">Overview</a>
+      <a href="#/watch" data-route="watch" data-ic="scan" data-s="18">Snatch Watch<span class="count" id="newCount" hidden></span></a>
+      <a href="#/monitor" data-route="monitor" data-ic="monitorPlay" data-s="18">Live Monitoring</a>
+      <a href="#/events" data-route="events" data-ic="siren" data-s="18">Snatch Events</a>
+      <a href="#/videos" data-route="videos" data-ic="video" data-s="18">Video Management</a>
+      <a href="#/settings" data-route="settings" data-ic="settings" data-s="18">Settings</a>
+    </nav>
+    <div class="side-foot"><span class="dot" id="connDot"></span><span id="connText">Connected</span></div>
+  </aside>
+  <div class="shade" id="shade" hidden></div>
+  <div class="content">
+    <header class="topbar"><button id="openNav" aria-label="Open menu" data-ic="menu" data-s="20"></button>Phone Snatch Detector</header>
+    <main id="page"></main>
+  </div>
+  <div id="modal"></div>
+  <div class="toasts" id="toasts" aria-live="polite"></div>
+  <script src="app.js"></script>
+</body>
+</html>
