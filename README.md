@@ -9,13 +9,19 @@ with automatic capture of the suspect's face.
 
 ## Screenshots
 
+**Snatch Watch** - upload a recorded video or connect a CCTV camera. Every captured snatch
+appears as a card: suspect's face, victim's face, confidence, the evidence that fired, and
+buttons to confirm or dismiss it.
+
+![Snatch Watch view of the dashboard](docs/dashboard.png)
+
+**Inspect** - every face shot, the alert frame and the clip of one event, with the score behind each piece of evidence.
+
+![Inspect view of one event](docs/inspect.png)
+
 **Detection** - the suspect is outlined in red the moment the snatch is confirmed; the stolen phone is boxed in yellow.
 
 ![Annotated frame at the moment of the alert](docs/detection.jpg)
-
-**Dashboard** - live view, video upload, camera connection, and one card per captured event with the suspect's faces, capture time, evidence and clip.
-
-![Dashboard with two captured events](docs/dashboard.png)
 
 ## Overview
 
@@ -43,8 +49,8 @@ capture time.
 - **Hand-over aware** - passing a phone to a friend does not raise an alert
 - **Crowd ready** - every person is tracked with an ID; scoring is per pair of people
 - **Best-face capture** - keeps the four best faces of each tracked person, ranked by size, frontal pose and sharpness, taken at different moments
-- **Evidence package** - faces, body, victim, alert frame, video clip and a JSON record per event
-- **Web dashboard** - upload a recorded video or connect a live camera, watch the annotated picture, review captured events
+- **Evidence package** - suspect and victim faces, body images, alert frame, video clip and a JSON record per event
+- **Operator dashboard** - upload videos or connect cameras, suspect-to-victim cards, confirm / dismiss review, filters, pop-up alerts, live view and a video library
 - **Live CCTV** - RTSP / HTTP streams and USB cameras, with automatic reconnect and frame dropping to stay in real time
 - **No training required** - uses pretrained YOLO11 models; weights download on first run
 
@@ -99,6 +105,7 @@ Faces keep improving for three seconds after the alert.
 detect.py          detection pipeline and command line tool
 dashboard.py       web dashboard (Python standard library only)
 requirements.txt
+docs/              screenshots used in this README
 output/            created at run time
   events/          one folder per detected snatch
   uploads/         videos uploaded through the dashboard
@@ -133,19 +140,39 @@ Install PyTorch for your hardware, then the remaining packages:
 .venv\Scripts\python dashboard.py
 ```
 
-Open <http://localhost:8000>.
+Open <http://localhost:8000>. The sidebar has four views.
 
-- **Analyse a recorded video** - drop a file on the upload box. Progress and the annotated picture appear in *Live view*.
-- **Connect a CCTV camera** - enter the camera's RTSP address (for example `rtsp://user:password@192.168.1.10:554/stream1`) or `0` for a camera attached to the PC, then *Start camera*. *Stop* ends the session cleanly.
-- **Captured events** - each card shows the suspect's best face, other face shots, capture time, source camera, confidence, the evidence that fired, images of the suspect and victim, and the clip. Click any image to enlarge it.
+| View | What it does |
+|------|--------------|
+| **Overview** | Totals (snatches, suspect faces, awaiting review, confirmed), the latest detections and the detector's state |
+| **Snatch Watch** | *Option 1 - Saved video:* drop a recorded file; it is analysed in the background. *Option 2 - CCTV live:* enter a camera name, an optional location and the RTSP address (or `0` for a camera on the PC), then *Connect & start*. Below, every detection as a card |
+| **Live Monitoring** | The annotated picture of the video or camera being analysed, with progress and a *Stop* button |
+| **Videos** | Every uploaded video with its size, upload time and number of detections; *Analyse again* re-runs one |
 
-The dashboard listens on `127.0.0.1` only and is meant to be used on the machine that runs it.
+Each detection card shows:
+
+- source type (**Video** or **CCTV**), source name and location, and a review badge (*New*, *Confirmed*, *Dismissed*)
+- the suspect's best face, an arrow, and the victim's face, with their track IDs
+- **Confidence**, **Alert after** (seconds from the grab to the alert) and **At** (position in the video, or clock time for a camera)
+- the evidence that fired, e.g. *Ran away · Victim reacted · Phone changed hands*
+- **Inspect** opens every face shot, the alert frame, the clip and the score of each piece of evidence;
+  **✓** confirms the theft, **✕** marks a false alarm (press again to undo); *Open clip* plays the clip
+
+Filters narrow the list by source, to events from a live camera in the last two minutes
+(*Happening now only*), and hide dismissed events. While a camera is connected, new detections
+also pop up as alerts in the corner. A detection can be linked to directly as
+`http://localhost:8000/#inspect=<event folder name>`.
+
+The dashboard runs one video or camera at a time. It listens on `127.0.0.1` only and is meant to
+be used on the machine that runs it.
+
+![Overview view of the dashboard](docs/overview.png)
 
 ### Command line
 
 ```bash
 .venv\Scripts\python detect.py --source video.mp4
-.venv\Scripts\python detect.py --source rtsp://user:password@192.168.1.10:554/stream1 --name "Platform 2" --show
+.venv\Scripts\python detect.py --source rtsp://user:password@192.168.1.10:554/stream1 --name "CAM 03" --location "Platform 2" --show
 .venv\Scripts\python detect.py --source 0 --show
 ```
 
@@ -154,6 +181,7 @@ The dashboard listens on `127.0.0.1` only and is meant to be used on the machine
 | `--source` | required | Video file, camera index, or RTSP / HTTP stream address |
 | `--out` | `output` | Output folder |
 | `--name` | source name | Camera or video name stored with each event |
+| `--location` | empty | Where the camera is, e.g. `Platform 2`, stored with each event |
 | `--pose-model` | `yolo11s-pose.pt` | Person / keypoint model |
 | `--phone-model` | `yolo11s.pt` | Phone detection model |
 | `--imgsz` | `960` | Inference resolution for people |
@@ -172,26 +200,34 @@ output/
     suspect_face.jpg                 best face of the suspect
     suspect_face_2.jpg ... _4.jpg    next best faces, from other moments
     suspect_body.jpg
+    victim_face.jpg                  best face of the victim
     victim.jpg
     alert_frame.jpg                  full frame at the alert, suspect outlined
     clip.mp4                         from 3 s before the contact to 3 s after the alert
-    event.json
+    event.json                       what was detected
+    review.json                      operator's decision, written by the dashboard
 ```
 
 `event.json`:
 
 ```json
 {
-  "captured_at": "2026-11-14 00:58:34",
-  "source": "Platform 2 - CAM 03",
-  "video_time": 7.46,
-  "suspect_id": 5,
+  "captured_at": "2026-11-14 12:42:01",
+  "source": "platform1_cam01.mp4",
+  "location": "Platform 1",
+  "live": false,
+  "video_time": 8.04,
+  "suspect_id": 4,
   "victim_id": 1,
-  "score": 0.56,
-  "evidence": { "flee": 0.0, "reaction": 0.82, "had_phone": 1.0, "transfer": 1.0 },
+  "contact_time": 6.54,
+  "alert_time": 8.04,
+  "score": 0.77,
+  "evidence": { "flee": 0.85, "reaction": 0.32, "had_phone": 1.0, "transfer": 1.0 },
   "face_captured": true
 }
 ```
+
+`review.json`: `{"state": "confirmed", "at": "2026-11-14 12:50:10"}` - `state` is `new`, `confirmed` or `dismissed`.
 
 ## Configuration
 
