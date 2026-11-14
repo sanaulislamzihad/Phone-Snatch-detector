@@ -75,6 +75,8 @@ SETTINGS_SCHEMA = [
          {"min": 0.8, "max": 3.0, "step": 0.1}],
         ["flee_min_dist", "Minimum flee distance", "Body heights the suspect must move away from the contact point",
          {"min": 0.3, "max": 3.0, "step": 0.1}],
+        ["flee_speed_up", "Flee speed-up", "How much faster than just before the contact the suspect must run (people running for a train do not speed up)",
+         {"min": 0.0, "max": 2.0, "step": 0.1}],
         ["contact_dist", "Contact distance", "Hand-to-hand distance (x body height) that counts as contact",
          {"min": 0.05, "max": 0.5, "step": 0.01}],
         ["watch_seconds", "Watch time after contact (s)", "How long a contact is followed before it is dropped",
@@ -92,7 +94,7 @@ SETTINGS_SCHEMA = [
 DEFAULTS = {
     "phone_model": "yolo26s.pt", "phone_imgsz": 1280, "pose_model": "yolo11s-pose.pt", "imgsz": 960,
     "device": "auto", "stride": 1,
-    "alert_score": 0.55, "walk_speed": 0.9, "run_speed": 2.0, "flee_min_speed": 1.4, "flee_min_dist": 0.9,
+    "alert_score": 0.55, "walk_speed": 0.9, "run_speed": 2.0, "flee_min_speed": 1.4, "flee_min_dist": 0.9, "flee_speed_up": 0.5,
     "contact_dist": 0.20, "watch_seconds": 3.5,
     "phone_conf": 0.25, "phone_conf_hand": 0.05, "phone_wrist_dist": 0.22,
 }
