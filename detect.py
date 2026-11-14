@@ -130,6 +130,8 @@ class TheftDetector:
         self.imgsz = imgsz
         self.phone_imgsz = phone_imgsz
         self.source_name = ""
+        self.location = ""
+        self.live = False
         self.device = device
         self.tracks: dict[int, Track] = {}
         self.events: dict[tuple[int, int], Event] = {}
@@ -389,25 +391,33 @@ class TheftDetector:
               f"score={ev.score:.2f}  {ev.parts}")
         self._save_event(ev, frame)
 
+    @staticmethod
+    def _enlarge(face: np.ndarray) -> np.ndarray:
+        """Scale a small face crop up for viewing, with a mild unsharp mask."""
+        k = max(1.0, 320.0 / max(face.shape[:2]))
+        big = cv2.resize(face, None, fx=k, fy=k, interpolation=cv2.INTER_LANCZOS4)
+        soft = cv2.GaussianBlur(big, (0, 0), 2.0)
+        return cv2.addWeighted(big, 1.5, soft, -0.5, 0)
+
     def _save_event(self, ev: Event, frame: np.ndarray | None = None):
         S = self.tracks.get(ev.suspect)
         if S is not None:
             # suspect_face.jpg is the best one, suspect_face_2..4.jpg are the runners-up
             for i, (_, _, f) in enumerate(S.faces):
-                k = max(1.0, 320.0 / max(f.shape[:2]))
-                big = cv2.resize(f, None, fx=k, fy=k, interpolation=cv2.INTER_LANCZOS4)
-                soft = cv2.GaussianBlur(big, (0, 0), 2.0)
-                big = cv2.addWeighted(big, 1.5, soft, -0.5, 0)   # mild unsharp mask
                 name = "suspect_face.jpg" if i == 0 else f"suspect_face_{i + 1}.jpg"
-                cv2.imwrite(str(ev.folder / name), big)
+                cv2.imwrite(str(ev.folder / name), self._enlarge(f))
             if S.body_img is not None:
                 cv2.imwrite(str(ev.folder / "suspect_body.jpg"), S.body_img)
         V = self.tracks.get(ev.victim)
-        if V is not None and V.body_img is not None:
-            cv2.imwrite(str(ev.folder / "victim.jpg"), V.body_img)
+        if V is not None:
+            if V.faces:
+                cv2.imwrite(str(ev.folder / "victim_face.jpg"), self._enlarge(V.faces[0][2]))
+            if V.body_img is not None:
+                cv2.imwrite(str(ev.folder / "victim.jpg"), V.body_img)
         if frame is not None:
             cv2.imwrite(str(ev.folder / "alert_frame.jpg"), frame)
-        info = dict(captured_at=ev.captured_at, source=self.source_name, video_time=round(ev.t_alert, 2),
+        info = dict(captured_at=ev.captured_at, source=self.source_name, location=self.location,
+                    live=self.live, video_time=round(ev.t_alert, 2),
                     suspect_id=ev.suspect, victim_id=ev.victim, contact_time=round(ev.t0, 2),
                     alert_time=round(ev.t_alert, 2), score=round(ev.score, 2), evidence=ev.parts,
                     face_captured=bool(S is not None and S.face_img is not None))
@@ -545,6 +555,7 @@ def main():
     ap.add_argument("--source", required=True, help="video file, camera index or RTSP url")
     ap.add_argument("--out", default="output")
     ap.add_argument("--name", default=None, help="camera / video name shown on the dashboard")
+    ap.add_argument("--location", default="", help="where the camera is, e.g. 'Platform 2'")
     ap.add_argument("--pose-model", default="yolo11s-pose.pt")
     ap.add_argument("--phone-model", default="yolo11s.pt")
     ap.add_argument("--imgsz", type=int, default=960, help="resolution for people / pose")
@@ -585,6 +596,8 @@ def main():
     det = TheftDetector(Config(), out, args.pose_model, args.phone_model, args.imgsz, args.device,
                         args.phone_imgsz)
     det.source_name = name
+    det.location = args.location[:60]
+    det.live = live
     writer = None
     n, t, done, count = 0, 0.0, 0, 0
     t_start = t_status = time.time()
